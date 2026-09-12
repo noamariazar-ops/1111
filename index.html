@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>QR File Receiver</title>
+<style>
+  :root { --bg:#0f1216; --panel:#171b21; --line:#2a303a; --text:#e6e9ef; --muted:#8b93a1; --accent:#4f8cff; --ok:#3ddc84; --fail:#ff5c5c; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,Segoe UI,Roboto,sans-serif; padding:10px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; margin-bottom:12px; }
+  h1 { font-size:16px; margin:0 0 10px; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:0 0 8px; }
+  button { background:var(--accent); color:#fff; border:none; border-radius:6px; padding:10px 14px; font-size:14px; cursor:pointer; margin:2px 4px 2px 0; }
+  button.secondary { background:#2a303a; }
+  video { width:100%; border-radius:8px; background:#000; max-height:50vh; }
+  .stat { display:flex; justify-content:space-between; font-size:13px; padding:3px 0; border-bottom:1px dashed var(--line); word-break:break-all; }
+  .stat span:first-child { color:var(--muted); margin-inline-end:8px; flex-shrink:0; }
+  .bar { background:#0d1014; border-radius:6px; height:14px; overflow:hidden; margin:8px 0; }
+  .bar-fill { background:var(--accent); height:100%; width:0%; transition:width .2s; }
+  input[type=password] { width:100%; background:#0d1014; border:1px solid var(--line); color:var(--text); border-radius:6px; padding:8px; }
+  #resultStatus { font-weight:bold; font-size:15px; }
+  #resultStatus.ok { color:var(--ok); }
+  #resultStatus.fail { color:var(--fail); }
+  #saveLink { display:none; background:var(--ok); color:#04170c; padding:10px 14px; border-radius:6px; text-decoration:none; font-weight:bold; }
+  #logArea { max-height:140px; overflow-y:auto; font-size:11px; color:var(--muted); font-family:monospace; }
+</style>
+</head>
+<body>
+  <div class="panel">
+    <h1>QR File Receiver</h1>
+    <video id="video" autoplay playsinline muted></video>
+    <div class="row">
+      <button id="startCamBtn">Start camera</button>
+      <button class="secondary" id="stopCamBtn">Stop camera</button>
+      <button class="secondary" id="resetBtn">Reset</button>
+    </div>
+    <div class="stat"><span>Camera</span><span id="cameraStatus">stopped</span></div>
+  </div>
+
+  <div class="panel">
+    <h2>Transfer</h2>
+    <div class="stat"><span>File</span><span id="metaFileName">—</span></div>
+    <div class="stat"><span>Compression</span><span id="metaComp">—</span></div>
+    <div class="stat"><span>Encryption</span><span id="metaEnc">—</span></div>
+    <div class="stat"><span>Frames received</span><span id="framesReceived">0</span></div>
+    <div class="stat"><span>Frames required</span><span id="framesRequired">?</span></div>
+    <div class="bar"><div class="bar-fill" id="progressBar"></div></div>
+    <div class="stat"><span>Progress</span><span id="progressPct">0%</span></div>
+    <div class="stat"><span>Missing chunks</span><span id="missingList">none</span></div>
+    <label>Password (only needed if the transmitter enabled encryption)</label>
+    <input type="password" id="pwInput" placeholder="Enter password, then it retries automatically">
+  </div>
+
+  <div class="panel">
+    <h2>Result</h2>
+    <div class="stat"><span>Status</span><span id="resultStatus">—</span></div>
+    <div class="stat"><span>Original size</span><span id="metaOrigSize">—</span></div>
+    <div class="stat"><span>Reconstructed size</span><span id="metaReconSize">—</span></div>
+    <div class="stat"><span>Expected SHA-256</span><span id="metaHashExpected">—</span></div>
+    <div class="stat"><span>Actual SHA-256</span><span id="metaHashActual">—</span></div>
+    <p><a id="saveLink" download>Save file</a></p>
+  </div>
+
+  <div class="panel">
+    <h2>Log</h2>
+    <div id="logArea"></div>
+  </div>
+
+<script>// ---- Shared QR-transfer protocol ----
+// Frame layout (bytes, big-endian multi-byte fields):
+// [0..1]   magic "QT"
+// [2]      version (1)
+// [3]      flags: bit0=encrypted, bit1=compressed, bit2=isParity, bit3=isMeta
+// [4..7]   transferId (uint32)
+// [8..9]   totalDataChunks (uint16)
+// [10..11] frameIndex (uint16)  -- for parity frames: index into parity list
+// [12..13] payloadLen (uint16)
+// [14..17] payload CRC32 (uint32)
+// [18..]   payload
+var PROTO_MAGIC0 = 0x51, PROTO_MAGIC1 = 0x54; // "Q","T"
+var HEADER_LEN = 18;
+var FLAG_ENCRYPTED = 1, FLAG_COMPRESSED = 2, FLAG_PARITY = 4, FLAG_META = 8;
+var PARITY_GROUP = 8; // 1 parity chunk per 8 data chunks (simple XOR erasure recovery)
+
+function crc32(bytes) {
+  var table = crc32.table || (crc32.table = (function () {
+    var t = new Uint32Array(256);
+    for (var n = 0; n < 256; n++) {
+      var c = n;
+      for (var k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      t[n] = c >>> 0;
+    }
+    return t;
+  })());
+  var crc = 0xFFFFFFFF;
+  for (var i = 0; i < bytes.length; i++) {
+    crc = table[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+function u16(v) { return [ (v >>> 8) & 0xFF, v & 0xFF ]; }
+function u32(v) { return [ (v >>> 24) & 0xFF, (v >>> 16) & 0xFF, (v >>> 8) & 0xFF, v & 0xFF ]; }
+function readU16(b, o) { return (b[o] << 8) | b[o + 1]; }
+function readU32(b, o) { return ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0; }
+
+function buildFrame(opts) {
+  // opts: transferId, totalDataChunks, frameIndex, flags, payload (Uint8Array)
+  var head = [];
+  head.push(PROTO_MAGIC0, PROTO_MAGIC1, 1, opts.flags);
+  head = head.concat(u32(opts.transferId));
+  head = head.concat(u16(opts.totalDataChunks));
+  head = head.concat(u16(opts.frameIndex));
+  head = head.concat(u16(opts.payload.length));
+  head = head.concat(u32(crc32(opts.payload)));
+  var out = new Uint8Array(head.length + opts.payload.length);
+  out.set(head, 0);
+  out.set(opts.payload, head.length);
+  return out;
+}
+
+function parseFrame(bytes) {
+  if (bytes.length < HEADER_LEN) return null;
+  if (bytes[0] !== PROTO_MAGIC0 || bytes[1] !== PROTO_MAGIC1) return null;
+  var flags = bytes[3];
+  var transferId = readU32(bytes, 4);
+  var totalDataChunks = readU16(bytes, 8);
+  var frameIndex = readU16(bytes, 10);
+  var payloadLen = readU16(bytes, 12);
+  var crc = readU32(bytes, 14);
+  var payload = bytes.slice(HEADER_LEN, HEADER_LEN + payloadLen);
+  if (payload.length !== payloadLen) return null;
+  if (crc32(payload) !== crc) return null; // corrupt frame, reject
+  return {
+    flags: flags,
+    encrypted: !!(flags & FLAG_ENCRYPTED),
+    compressed: !!(flags & FLAG_COMPRESSED),
+    isParity: !!(flags & FLAG_PARITY),
+    isMeta: !!(flags & FLAG_META),
+    transferId: transferId,
+    totalDataChunks: totalDataChunks,
+    frameIndex: frameIndex,
+    payload: payload
+  };
+}
+
+function xorBytes(a, b) {
+  var len = Math.max(a.length, b.length);
+  var out = new Uint8Array(len);
+  for (var i = 0; i < len; i++) out[i] = (i < a.length ? a[i] : 0) ^ (i < b.length ? b[i] : 0);
+  return out;
+}
+
+// Base64 wrapping: QR payloads are base64-encoded to pure ASCII text before
+// being placed in the QR (byte mode). This is required because the phone's
+// BarcodeDetector API only exposes a decoded *string* (rawValue), not raw
+// bytes — and different browsers may decode non-ASCII byte-mode QR content
+// with different text encodings, which would corrupt arbitrary binary data
+// (compressed/encrypted payloads are not valid UTF-8). Restricting the QR
+// content to ASCII base64 characters makes the round-trip lossless on every
+// browser, at the cost of ~33% size overhead.
+function bytesToBase64(bytes) {
+  var bin = '';
+  for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+function base64ToBytes(str) {
+  var bin = atob(str);
+  var out = new Uint8Array(bin.length);
+  for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function asciiToBytes(str) {
+  var out = new Uint8Array(str.length);
+  for (var i = 0; i < str.length; i++) out[i] = str.charCodeAt(i) & 0xFF;
+  return out;
+}
+
+function bytesToHex(bytes) {
+  var s = '';
+  for (var i = 0; i < bytes.length; i++) s += bytes[i].toString(16).padStart(2, '0');
+  return s;
+}
+</script>
+<script>// ---- Receiver logic ----
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var state = {
+    stream: null, scanning: false, detector: null,
+    transferId: null, meta: null, total: 0,
+    chunks: {}, // frameIndex -> Uint8Array
+    parity: {}, // groupIndex -> Uint8Array
+    seenFrameKeys: {}, // dedupe: transferId:frameIndex:isParity
+    lastRaw: null
+  };
+
+  function log(msg) {
+    var el = $('logArea');
+    var line = document.createElement('div');
+    line.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
+    el.prepend(line);
+    while (el.children.length > 200) el.removeChild(el.lastChild);
+  }
+
+  function resetTransferIfNeeded(f) {
+    if (state.transferId !== f.transferId) {
+      state.transferId = f.transferId;
+      state.total = f.totalDataChunks;
+      state.chunks = {}; state.parity = {}; state.meta = null;
+      log('New transfer detected (id ' + f.transferId + '), ' + f.totalDataChunks + ' data chunks expected.');
+    }
+  }
+
+  function updateProgress() {
+    var have = Object.keys(state.chunks).length;
+    $('framesReceived').textContent = have;
+    $('framesRequired').textContent = state.total || '?';
+    var pct = state.total ? Math.round((have / state.total) * 100) : 0;
+    $('progressBar').style.width = pct + '%';
+    $('progressPct').textContent = pct + '%';
+    var missing = [];
+    if (state.total) {
+      for (var i = 0; i < state.total; i++) if (!state.chunks[i]) missing.push(i);
+    }
+    $('missingList').textContent = missing.length ? (missing.length > 30 ? missing.length + ' chunks missing' : missing.join(',')) : 'none';
+    if (state.meta) {
+      $('metaFileName').textContent = state.meta.name;
+      $('metaComp').textContent = state.meta.compressed ? 'yes (deflate)' : 'no';
+      $('metaEnc').textContent = state.meta.encrypted ? 'yes (AES-GCM)' : 'no';
+    }
+    if (state.total && have >= state.total) tryReconstruct();
+  }
+
+  function tryRecoverWithParity() {
+    if (!state.total) return;
+    var groupSize = (state.meta && state.meta.parityGroup) || 8;
+    var recovered = 0;
+    for (var g = 0; g * groupSize < state.total; g++) {
+      var start = g * groupSize, end = Math.min(start + groupSize, state.total);
+      var missingIdx = -1, missingCount = 0;
+      for (var i = start; i < end; i++) if (!state.chunks[i]) { missingIdx = i; missingCount++; }
+      if (missingCount === 1 && state.parity[g]) {
+        var acc = state.parity[g].slice();
+        for (var j = start; j < end; j++) if (j !== missingIdx) acc = xorBytes(acc, state.chunks[j]);
+        state.chunks[missingIdx] = acc;
+        recovered++;
+      }
+    }
+    if (recovered) { log('Recovered ' + recovered + ' missing chunk(s) using XOR parity.'); updateProgress(); }
+  }
+
+  var reconstructing = false;
+  async function tryReconstruct() {
+    if (reconstructing) return;
+    reconstructing = true;
+    try {
+      var buf = new Uint8Array(state.total * ((state.meta && state.meta.chunkSize) || 110));
+      var offset = 0, sizes = [];
+      for (var i = 0; i < state.total; i++) {
+        var c = state.chunks[i];
+        buf.set(c, offset); offset += c.length; sizes.push(c.length);
+      }
+      var finalBytes = buf.slice(0, offset);
+
+      var meta = state.meta;
+      if (!meta) { log('Have all chunks but metadata frame not seen yet — waiting.'); reconstructing = false; return; }
+
+      var workingBytes = finalBytes;
+      if (meta.encrypted) {
+        var pw = $('pwInput').value;
+        if (!pw) { log('Encrypted transfer — enter password below and it will retry automatically.'); reconstructing = false; return; }
+        try {
+          var salt = workingBytes.slice(0, 16), iv = workingBytes.slice(16, 28), ct = workingBytes.slice(28);
+          var keyMaterial = await crypto.subtle.importKey('raw', new TextEncoder().encode(pw), 'PBKDF2', false, ['deriveKey']);
+          var key = await crypto.subtle.deriveKey(
+            { name: 'PBKDF2', salt: salt, iterations: 250000, hash: 'SHA-256' },
+            keyMaterial, { name: 'AES-GCM', length: 256 }, false, ['decrypt']
+          );
+          var pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, key, ct);
+          workingBytes = new Uint8Array(pt);
+        } catch (e) {
+          $('resultStatus').textContent = 'DECRYPTION FAILED — wrong password or corrupted data';
+          $('resultStatus').className = 'fail';
+          log('Decryption failed: ' + e.message);
+          reconstructing = false;
+          return;
+        }
+      }
+      if (meta.compressed) {
+        if (typeof DecompressionStream === 'undefined') {
+          log('Browser lacks DecompressionStream — cannot decompress.');
+          reconstructing = false; return;
+        }
+        var ds = new DecompressionStream('deflate-raw');
+        var writer = ds.writable.getWriter();
+        writer.write(workingBytes); writer.close();
+        workingBytes = new Uint8Array(await new Response(ds.readable).arrayBuffer());
+      }
+
+      var digest = await crypto.subtle.digest('SHA-256', workingBytes);
+      var hashHex = bytesToHex(new Uint8Array(digest));
+      $('metaOrigSize').textContent = meta.origSize + ' bytes';
+      $('metaReconSize').textContent = workingBytes.length + ' bytes';
+      $('metaHashExpected').textContent = meta.sha256;
+      $('metaHashActual').textContent = hashHex;
+
+      if (hashHex === meta.sha256 && workingBytes.length === meta.origSize) {
+        $('resultStatus').textContent = 'TRANSFER COMPLETE — VERIFIED';
+        $('resultStatus').className = 'ok';
+        var blob = new Blob([workingBytes], { type: meta.mime || 'application/octet-stream' });
+        var url = URL.createObjectURL(blob);
+        var a = $('saveLink');
+        a.href = url; a.download = meta.name || 'received.bin'; a.style.display = 'inline-block';
+        a.textContent = 'Save ' + meta.name;
+        log('Transfer verified and ready to save.');
+        stopScanning();
+      } else {
+        $('resultStatus').textContent = 'TRANSFER FAILED — FILE DOES NOT MATCH';
+        $('resultStatus').className = 'fail';
+        log('Hash mismatch — waiting for more/looped frames in case chunks were misassembled.');
+      }
+    } finally {
+      reconstructing = false;
+    }
+  }
+
+  function handleDecodedString(str) {
+    if (str === state.lastRaw) return; // cheap same-frame debounce
+    state.lastRaw = str;
+    var bytes;
+    try { bytes = base64ToBytes(str); } catch (e) { return; }
+    var f = parseFrame(bytes);
+    if (!f) return; // corrupt / not our protocol -> silently ignore
+    resetTransferIfNeeded(f);
+
+    var key = f.transferId + ':' + f.frameIndex + ':' + (f.isParity ? 'p' : (f.isMeta ? 'm' : 'd'));
+    if (state.seenFrameKeys[key]) return; // duplicate, harmless
+    state.seenFrameKeys[key] = true;
+
+    if (f.isMeta) {
+      try { state.meta = JSON.parse(new TextDecoder().decode(f.payload)); } catch (e) { return; }
+      log('Metadata received: ' + state.meta.name + ' (' + state.meta.origSize + ' bytes)');
+      updateProgress();
+      return;
+    }
+    if (f.isParity) {
+      state.parity[f.frameIndex] = f.payload;
+      tryRecoverWithParity();
+      return;
+    }
+    state.chunks[f.frameIndex] = f.payload;
+    updateProgress();
+  }
+
+  var scanRAF = null;
+  async function scanLoop() {
+    if (!state.scanning) return;
+    try {
+      var video = $('video');
+      if (state.detector && video.readyState >= 2) {
+        var codes = await state.detector.detect(video);
+        for (var i = 0; i < codes.length; i++) handleDecodedString(codes[i].rawValue);
+      }
+    } catch (e) { /* transient detection errors are normal, ignore */ }
+    scanRAF = requestAnimationFrame(scanLoop);
+  }
+
+  async function startCamera() {
+    try {
+      state.stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } } });
+    } catch (e) {
+      log('Camera error: ' + e.message);
+      $('cameraStatus').textContent = 'permission denied / unavailable';
+      return;
+    }
+    $('video').srcObject = state.stream;
+    $('cameraStatus').textContent = 'active';
+    if ('BarcodeDetector' in window) {
+      state.detector = new BarcodeDetector({ formats: ['qr_code'] });
+    } else {
+      log('BarcodeDetector API not available in this browser — continuous local QR scanning cannot run. Use a recent Chrome for Android (Chrome 83+ generally supports it), or see the troubleshooting notes.');
+      $('cameraStatus').textContent = 'active (no QR scanner available!)';
+      return;
+    }
+    state.scanning = true;
+    scanLoop();
+  }
+
+  function stopScanning() {
+    state.scanning = false;
+    if (scanRAF) cancelAnimationFrame(scanRAF);
+  }
+  function stopCamera() {
+    stopScanning();
+    if (state.stream) state.stream.getTracks().forEach(function (t) { t.stop(); });
+    $('cameraStatus').textContent = 'stopped';
+  }
+
+  function resetAll() {
+    stopCamera();
+    state.transferId = null; state.meta = null; state.total = 0;
+    state.chunks = {}; state.parity = {}; state.seenFrameKeys = {}; state.lastRaw = null;
+    updateProgress();
+    $('resultStatus').textContent = '—'; $('resultStatus').className = '';
+    $('saveLink').style.display = 'none';
+  }
+
+  window.addEventListener('DOMContentLoaded', function () {
+    $('startCamBtn').addEventListener('click', startCamera);
+    $('stopCamBtn').addEventListener('click', stopCamera);
+    $('resetBtn').addEventListener('click', resetAll);
+    $('pwInput').addEventListener('change', function () { if (state.total) tryReconstruct(); });
+    updateProgress();
+  });
+})();
+</script>
+</body>
+</html>
